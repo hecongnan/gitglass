@@ -105,6 +105,7 @@ class App:
         self.repo = None
         self.repos, self.files, self.commits, self.rows = [], [], [], []
         self.commit = None
+        self.all_files = False
         self.selected = ''
         self.file_index, self.history_index = 0, 0
         self.scroll, self.horizontal = 0, 0
@@ -253,12 +254,12 @@ class App:
         def worker():
             # Missing default directories are skipped; explicitly passed roots are validated by main.
             backend.ROOTS = [p for p in self.roots if p.is_dir()]
-            data = backend.scan()
-            return sorted(data['repos'], key=lambda r: r['path'])
+            data = backend.scan(include_root_repos=True)
+            return sorted(data['repos'], key=lambda r: (not r['explicit'], not r['has_changes'], r['path']))
         def done(repos):
             self.repos = repos
             self.next_scan = time.monotonic() + self.interval
-            self.message = f'{len(repos)} changed repositories · r switch · a add directory'
+            self.message = f'{len(repos)} repositories · r switch · a add directory'
             if not self.repo and repos:
                 self.select_repo(repos[0])
             elif self.repo:
@@ -282,9 +283,11 @@ class App:
             return
         repo = self.repo['id']
         def worker():
-            return backend.changed_files(repo, commit), backend.history(repo)
+            files = backend.changed_files(repo, commit)
+            all_files = commit is None and not files
+            return (backend.tracked_files(repo) if all_files else files), backend.history(repo), all_files
         def done(data):
-            self.files, self.commits = data
+            self.files, self.commits, self.all_files = data
             self.commit = commit
             if not preserve:
                 self.viewed.clear()
@@ -311,7 +314,8 @@ class App:
             if not preserve:
                 self.scroll = self.horizontal = 0
             self.message = 'Read-only · nothing is uploaded or modified'
-        self.submit(lambda: backend.diff(self.repo['id'], path, self.commit), done, 'Reading diff…')
+        reader = backend.preview_file if self.all_files else lambda repo, name: backend.diff(repo, name, self.commit)
+        self.submit(lambda: reader(self.repo['id'], path), done, 'Reading file…' if self.all_files else 'Reading diff…')
 
     def bounds(self):
         h, w = self.screen.getmaxyx()
@@ -359,8 +363,8 @@ class App:
         self.screen.refresh()
 
     def draw_files(self, h, left):
-        self.put(4, 2, f'{len(self.files)} changed files', 'blue', left-4, True)
-        self.put(5, 2, ('⌕ '+self.query) if self.query else 'Local changes · read-only', 'muted', left-4)
+        self.put(4, 2, f"{len(self.files)} {'tracked' if self.all_files else 'changed'} files", 'blue', left-4, True)
+        self.put(5, 2, ('⌕ '+self.query) if self.query else 'Working tree clean' if self.all_files else 'Local changes · read-only', 'muted', left-4)
         self.tree = file_tree(self.files, self.collapsed, self.query)
         self.file_index = min(self.file_index, max(0, len(self.tree)-1))
         self.offsets[0] = max(0, min(self.offsets[0], self.file_index))
@@ -380,7 +384,7 @@ class App:
             status_tone = {'M':'amber','A':'green','?':'cyan','D':'red','R':'blue','C':'blue','U':'pink'}.get(row['status'],'muted')
             self.put(y, left-3, row['status'], self.semantic(status_tone,selected), 2, True)
         if not self.tree:
-            self.put(8, 2, 'No matching files' if self.query else 'No changes found', 'muted', left-4)
+            self.put(8, 2, 'No matching files' if self.query else 'No tracked files' if self.all_files else 'No changes found', 'muted', left-4)
             if not self.repo:
                 self.put(10, 2, 'Press a to scan a directory', 'muted', left-4)
 
@@ -388,7 +392,7 @@ class App:
         x, size = left+3, right-left-5
         title = self.selected or 'Your next commit starts here.'
         self.put(4, x, title, 'accent', size, True)
-        label = next((c['short']+' · '+c['message'] for c in self.commits if c['id']==self.commit), 'Uncommitted changes')
+        label = next((c['short']+' · '+c['message'] for c in self.commits if c['id']==self.commit), 'File preview · working tree clean' if self.all_files else 'Uncommitted changes')
         self.put(5, x, label, 'amber' if self.commit else 'green', size)
         count = len({f['path'] for f in self.files} & self.viewed)
         additions = sum(r[0]=='add' for r in self.rows)
@@ -396,6 +400,8 @@ class App:
         metrics = [(f'+{additions}', 'green'), (f'  −{deletions}', 'red'),
                    (f'    {count}/{len(self.files)} viewed', 'purple'),
                    (f'    {"SPLIT" if self.split else "UNIFIED"}', 'cyan')]
+        if self.all_files:
+            metrics = [('READ-ONLY PREVIEW', 'cyan'), (f'    {count}/{len(self.files)} viewed', 'purple')]
         cursor = x
         for text,tone in metrics:
             self.put(6,cursor,text,tone,max(0,x+size-cursor))
@@ -462,7 +468,7 @@ class App:
             if selected:
                 self.fill(y, x-1, size+1, style)
                 self.fill(y+1, x-1, size+1, style)
-            message = item['message'] if item else 'Uncommitted changes'
+            message = item['message'] if item else 'Working tree clean' if self.all_files else 'Uncommitted changes'
             category = message.split(':',1)[0].split('(',1)[0]
             tone = {'feat':'green','fix':'amber','refactor':'cyan','style':'pink','docs':'blue','test':'purple','chore':'muted'}.get(category,'normal') if item else 'purple'
             self.put(y,x,('● ' if current else '○ '),self.semantic('green' if current else tone,selected),2)
@@ -493,7 +499,7 @@ class App:
         start = max(0,self.modal_index-capacity+1)
         lines = [('› ' if i==self.modal_index else '  ')+r['name']+'  '+r['path'] for i,r in enumerate(self.repos) if start<=i<start+capacity]
         if not lines:
-            lines = ['No changed repositories. Press Esc, then a to add a directory.']
+            lines = ['No repositories found. Press Esc, then a to add a directory.']
         lines += ['', 'j/k select · Enter open · Esc close']
         self.box('LOCAL REPOSITORIES', lines,h,w)
 
@@ -657,7 +663,7 @@ def main():
     parser.add_argument('--root', action='append', default=[], help='Additional scan directory; repeatable')
     parser.add_argument('--interval', type=int, default=30, help='Auto-refresh seconds (minimum 5)')
     parser.add_argument('--theme', choices=['light','dark'], default='light')
-    parser.add_argument('--version', action='version', version='gitglass 0.2.0')
+    parser.add_argument('--version', action='version', version='gitglass 0.2.1')
     args = parser.parse_args()
     if not shutil.which('git'):
         parser.error('Git is required. Install Git and try again.')

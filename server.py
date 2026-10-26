@@ -25,12 +25,35 @@ def git(repo, *args, allow_error=False):
         raise ValueError(p.stderr.decode(errors='replace').strip() or 'Git command failed')
     return p.stdout.decode('utf-8', errors='replace')
 
-def scan(root=None):
+def repository_at(directory):
+    """Resolve the worktree root, including when launched in a nested directory."""
+    value = git(directory, 'rev-parse', '--show-toplevel', allow_error=True).strip()
+    return str(Path(value).resolve()) if value else None
+
+
+def scan(root=None, include_root_repos=False):
     roots = [Path(root).expanduser().resolve()] if root else ROOTS
     found = {}
+    explicit = set()
+    def register(current, include_clean=False):
+        try:
+            status = git(current, 'status', '--porcelain=v1', '-z')
+            if status or include_clean:
+                key = str(Path(current).resolve())
+                found[key] = {'id': key, 'name': Path(current).name, 'path': key,
+                              'branch': git(current, 'branch', '--show-current').strip() or 'detached HEAD',
+                              'has_changes': bool(status), 'explicit': key in explicit}
+        except (ValueError, subprocess.TimeoutExpired):
+            pass
     for base in roots:
         if not base.is_dir():
             raise ValueError('扫描目录不存在')
+        base = base.resolve()
+        if include_root_repos:
+            selected = repository_at(base)
+            if selected:
+                explicit.add(selected)
+                register(selected, include_clean=True)
         # Bounded breadth and depth keep discovery responsive on large home directories.
         visited = 0
         for directory, dirs, files in os.walk(base, followlinks=False):
@@ -42,14 +65,7 @@ def scan(root=None):
             if len(current.relative_to(base).parts) >= 6:
                 dirs[:] = []
             if (current / '.git').exists():
-                try:
-                    status = git(current, 'status', '--porcelain=v1', '-z')
-                    if status:
-                        key = str(current.resolve())
-                        found[key] = {'id': key, 'name': current.name, 'path': key,
-                                      'branch': git(current, 'branch', '--show-current').strip() or 'detached HEAD'}
-                except (ValueError, subprocess.TimeoutExpired):
-                    pass
+                register(current, include_clean=str(current.resolve()) in explicit)
     with LOCK:
         if root:
             resolved = Path(root).expanduser().resolve()
@@ -88,6 +104,34 @@ def changed_files(repo, commit=None):
             if 'R' in status or 'C' in status:
                 i += 1
     return files
+
+def tracked_files(repo):
+    paths = git(repo, 'ls-files', '--cached', '-z').split('\0')
+    return [{'path': path, 'status': ''} for path in dict.fromkeys(paths) if path]
+
+
+def preview_file(repo, name):
+    """Preview unchanged files without presenting their contents as additions."""
+    root = Path(repo).resolve()
+    target = root / name
+    # Symlink content is the link itself, never the file it points to.
+    if not target.parent.resolve().is_relative_to(root):
+        raise ValueError('文件路径无效')
+    if target.is_symlink():
+        data = os.readlink(target).encode('utf-8', errors='replace')
+    elif target.is_file():
+        if target.stat().st_size > 1024 * 1024:
+            return '文件大于 1 MB，请在编辑器中查看。'
+        data = target.read_bytes()
+    else:
+        return 'No text preview available (directory, submodule, or missing file).'
+    if b'\0' in data:
+        return 'Binary file — 无法显示文本内容'
+    lines = data.decode('utf-8', errors='replace').splitlines()
+    if not lines:
+        return 'Empty file'
+    return f'@@ -1,{len(lines)} +1,{len(lines)} @@ File preview (unchanged)\n' + '\n'.join(' ' + line for line in lines)
+
 
 def history(repo):
     raw = git(repo, 'log', '-60', '--format=%H%x00%h%x00%s%x00%an%x00%aI%x00', allow_error=True)
